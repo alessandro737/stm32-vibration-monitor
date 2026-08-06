@@ -65,6 +65,8 @@ test/ Host-native unit tests (no cross-compiler)
 captures/ Raw sigrok .sr logic analyzer captures
 docs/ Engineering log
 
+Build output is named `vibemon` (vibemon.elf, vibemon.bin, vibemon.map).
+
 ## License
 
 MIT
