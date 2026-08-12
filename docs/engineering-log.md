@@ -115,9 +115,9 @@ the thing to practice, not the individual commands.
 **Open questions.**
 - The first `cmake` configure failed with "cannot open linker script
   file" for a path that existed. A second configure with the identical
-  command succeeded. [Note here what, if anything, actually changed —
-  or state plainly that it is unexplained.] Suspect a stale cache from
-  a configure run made before the linker script was added.
+  command succeeded. [cmake is case sensitive and file name didnt match
+   exactly] Suspect a stale cache from a configure run made before the
+  linker script was added.
 - The `_close` / `_lseek` / `_read` / `_write` "not implemented and will
   always fail" warnings are `nosys.specs` stubs and the linker notes
   they may be garbage-collected. Should confirm from the `.map` file
