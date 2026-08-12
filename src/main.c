@@ -21,13 +21,13 @@ int main(void)
 	while (1)
 	{
 		// Set PA5
-		GPIOA->BSRR |= GPIO_BSRR_BS5;
+		GPIOA->BSRR = GPIO_BSRR_BS5;
 
 		// Delay
 		for (volatile uint32_t i = 0; i < 1000000; i++);
 
 		// Reset PA5
-		GPIOA->BSRR |= GPIO_BSRR_BR5;
+		GPIOA->BSRR = GPIO_BSRR_BR5;
 
 		// Delay
 		for (volatile uint32_t i = 0; i < 1000000; i++);
