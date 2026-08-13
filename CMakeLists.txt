@@ -17,6 +17,7 @@ set(TARGET ${PROJECT_NAME}.elf)
 
 add_executable(${TARGET}
     src/main.c
+    src/bsp/clock.c
     third_party/cmsis_device_f4/Source/Templates/gcc/startup_stm32f411xe.s
     third_party/cmsis_device_f4/Source/Templates/system_stm32f4xx.c
 )
@@ -25,9 +26,9 @@ add_executable(${TARGET}
 target_compile_definitions(${TARGET} PRIVATE STM32F411xE)
 
 target_include_directories(${TARGET} PRIVATE
-    include
     third_party/cmsis_device_f4/Include
     third_party/CMSIS_5/CMSIS/Core/Include
+    src
 )
 
 target_compile_options(${TARGET} PRIVATE

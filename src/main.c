@@ -7,9 +7,14 @@
  * */
 
 #include <stm32f4xx.h>
+#include "bsp/clock.h"
+
 
 int main(void)
 {
+	// Initialize the system clock
+	clock_init();
+	
 	// Enable GPIOA clock
 	RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
 

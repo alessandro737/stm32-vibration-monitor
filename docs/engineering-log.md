@@ -136,3 +136,122 @@ raised **before** the clock, HSE from the ST-LINK's 8 MHz MCO into the
 PLL for 100 MHz, then AHB/APB prescalers. The SysTick reload value will
 have to change, which is the point. Blink rate changing is free visual
 confirmation the PLL locked.
+
+## 2026-08-13 — Clock tree bring-up: HSI → PLL → 100 MHz SYSCLK
+
+**Goal:** Configure SYSCLK to 100 MHz from the internal HSI via the main PLL,
+with correct flash latency and bus prescalers. Written directly against RM0383
+rather than using CubeMX-generated init.
+
+**Final config (verified from a cold reset, no debugger intervention):**
+- HSI 16 MHz → PLLM=8 → 2 MHz VCO input (recommended value per §6.3.2)
+- PLLN=100 → 200 MHz VCO output → PLLP=÷2 → **100 MHz SYSCLK**
+- AHB ÷1 = 100 MHz, APB1 ÷2 = 50 MHz, APB2 ÷1 = 100 MHz
+- Flash: 3 wait states, prefetch + I-cache + D-cache enabled
+- `RCC->PLLCFGR` reads `0x24001908`; `SystemCoreClock` reads `100000000`
+
+---
+
+### Bug 1: hang polling PWR_CSR_VOSRDY
+
+Code spun forever on `while ((PWR->CSR & PWR_CSR_VOSRDY) == 0)`. Classified as
+a hang, not a fault — GDB halted with `$pc` inside the loop at a valid address,
+no HardFault.
+
+Read state before theorizing:
+- `RCC->APB1ENR = 0x10000000` → PWREN set, peripheral is clocked
+- `PWR->CR = 0xc000` → VOS = 0b11 (Scale 1), write landed
+- `PWR->CSR = 0x0` → VOSRDY clear
+
+The first two ruled out my initial suspicion (an RCC clock-enable propagation
+delay eating the `PWR->CR` write) — if that were happening, `PWR->CR` would not
+have read back my value.
+
+Tested the remaining hypothesis by setting PLLON by hand from the debugger
+rather than rebuilding:
+
+    (gdb) set var RCC->CR = RCC->CR | 0x01000000
+    (gdb) p/x PWR->CSR
+    $9 = 0x4000
+
+VOSRDY asserted immediately. **Fix:** moved the VOSRDY poll to after PLLON /
+PLLRDY.
+
+*Caveat: this is an empirical result on one board. I have not yet confirmed in
+RM0383 §5.4.2 that the VOSRDY-after-PLLON dependency is a documented hardware
+guarantee. TODO before I rely on it.*
+
+---
+
+### Bug 2: PLLCFGR writes silently rejected
+
+After clearing bug 1, SYSCLK came up but `SystemCoreClock` read 96000000, not
+the 100 MHz I configured. `RCC->PLLCFGR` read `0x24003010`, which is the
+**reset value**: PLLM=16, PLLN=192, PLLP=÷2 → 16/16 × 192 / 2 = 96 MHz. None of
+my writes had taken.
+
+Cause: PLLCFGR is only writable while the PLL is off. Because I had turned
+PLLON on manually while debugging bug 1, the subsequent PLLCFGR writes in my
+code were rejected — with no fault and no error flag. The code appeared to work
+and the LED blinked faster, which is exactly why "it blinks" is not verification.
+
+**Fix:** none needed in source — the correct ordering (configure PLLCFGR, then
+PLLON) was already there. The rejection was an artifact of my debugger poke.
+Confirmed by rebuilding and running from a cold reset.
+
+Worth noting I also got lucky: 3 wait states happens to be correct for 96 MHz
+as well as 100 MHz, so the accidental frequency didn't produce a flash access
+fault that would have surfaced the problem sooner.
+
+---
+
+### Notes / decisions
+
+- **`SystemCoreClockUpdate()` over hardcoding `SYSCLK_FREQ`.** This is what
+  caught bug 2. It re-derives the frequency from PLLCFGR/CFGR, so it reported
+  96 MHz truthfully. A hardcoded constant would have claimed 100 MHz on a chip
+  running at 96 and every downstream timing calculation would have been 4% off
+  with nothing to indicate it.
+- **VOS write is arguably redundant.** `PWR_CR` reset value on F411 is `0xc000`
+  — already Scale 1. Kept the explicit write anyway: F401 uses a different VOS
+  encoding, and I'd rather state intent than depend on a reset value.
+- **PLLQ left at reset value 4** → 50 MHz on the Q output. Irrelevant now (no
+  USB/SDIO). If USB is ever added, note that a 200 MHz VCO has no integer
+  divisor giving 48 MHz, so the whole PLL config would need reworking.
+- **APB1 at exactly 50 MHz, APB2 at exactly 100 MHz** — both at the datasheet
+  maximum with zero headroom. Deliberate, but verify against DS10314.
+- **Unbounded `while` polls on HSIRDY / PLLRDY / VOSRDY / SWS.** Any clock
+  failure hangs silently with no output — the worst failure mode to diagnose.
+  Fine on a Nucleo where HSI always comes up; should be bounded retries with a
+  fault path before this goes anywhere real.
+- **`__NOP()` after the APB1ENR write was removed.** Added as a guard against
+  the clock-enable delay erratum, but my own register reads had already
+  disproved that hypothesis, and a single `nop` isn't the documented workaround
+  anyway (that's a read-back of the enable register). Removed rather than left
+  in with a comment describing a mechanism I hadn't actually observed.
+
+---
+
+### Open / next
+
+- [ ] Confirm VOSRDY/PLLON dependency in RM0383 §5.4.2
+- [ ] Verify APB1/APB2 ceilings against DS10314
+- [ ] **Route SYSCLK to MCO1 (PA8) and measure with the FX2LP.** Every number
+      above is a register I wrote or a value derived from one — no independent
+      measurement yet. Needed before FreeRTOS, since `configCPU_CLOCK_HZ`
+      inherits this and a wrong clock there produces timing bugs that look like
+      scheduler bugs. Will need MCO1PRE prescaling to get under the analyzer's
+      sample rate.
+
+### GDB technique worth keeping
+
+- Read state *before* forming a hypothesis. Three `p/x` calls killed my leading
+  theory in under a minute.
+- `set var` on a peripheral register tests an ordering hypothesis without a
+  build-flash cycle. This is what actually found bug 1.
+- `monitor reset` leaves the core *running* → `continue` gives "target not
+  halted". Use `monitor reset halt`.
+- `step` on a polling loop single-steps forever. `next` steps over,
+  `advance <line>` runs to a line without a permanent breakpoint, `jump <line>`
+  skips code entirely (only ever within one function — it moves `$pc` and
+  nothing else).
