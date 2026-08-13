@@ -255,3 +255,145 @@ fault that would have surfaced the problem sooner.
   `advance <line>` runs to a line without a permanent breakpoint, `jump <line>`
   skips code entirely (only ever within one function — it moves `$pc` and
   nothing else).
+
+  ## 2026-08-13 (cont.) — SPI1 bring-up, ADXL345 DEVID read
+
+**Goal:** First working SPI transaction. Read ADXL345 DEVID (0x00),
+expect 0xE5. One transaction validates CPOL, CPHA, bit order, AF
+mapping, prescaler and CS timing simultaneously — chosen deliberately
+as the smallest thing that proves the whole config.
+
+**Result:** 0xE5. Confirmed in GDB.
+
+---
+
+### Config decisions
+
+**Mode 3 (CPOL=1, CPHA=1).** Stated directly in the ADXL345 datasheet.
+CPOL=1 means SCLK idles high; CPHA=1 means the slave drives on the first
+edge and the master latches on the second (rising), which is what gives
+the slave setup time. A CPHA error would shift the received byte by one
+bit position and often decode as a plausible-looking value rather than
+obvious garbage.
+
+**BR=0b111 → ~390 kHz** from APB2 at 100 MHz. Two separate ceilings
+apply and they have different failure modes:
+- ADXL345 max SCLK is 5 MHz — a *hardware* limit; exceed it and the data
+  is genuinely corrupt.
+- FX2LP analyzer at 24 MSa/s shared across channels — an *instrument*
+  limit; exceed ~1/10 of the sample rate and the data is fine but the
+  capture aliases and lies. Rule of thumb adopted: sample rate ≥ 10× SCLK.
+
+Only the first still applies once the analyzer is disconnected.
+
+**Software CS on PA4, not hardware NSS.** NSS in master mode is not a
+chip select — it is a multi-master arbitration input. If it reads low the
+peripheral assumes another master claimed the bus, sets MODF, and clears
+MSTR and SPE, silently dropping out of master mode. SSM=1/SSI=1 makes the
+peripheral ignore the physical pin and treat NSS as internally high.
+
+The SSOE hardware-output alternative pulls NSS low while SPE is set and
+holds it there — it does not frame transactions. The ADXL345 requires CS
+to deassert between nonsequential register accesses, which SSOE cannot
+express.
+
+**DFF=0 (8-bit).** The ADXL345's control-byte-plus-data structure looks
+16-bit, but DFF sets the width of a DR access, not the frame boundary —
+the frame is defined by CS, which is a GPIO. A burst read of X/Y/Z is
+1 control byte + 6 data bytes = 7 bytes, which is odd and cannot be
+expressed in 16-bit accesses. Byte-at-a-time handles both the 1-byte and
+6-byte cases with the same code path.
+
+**CRC off, BIDIMODE=0** (full duplex, 4-wire — the ADXL345's default;
+the SPI bit in DATA_FORMAT 0x31 is left at reset).
+
+---
+
+### The full-duplex drain
+
+The non-obvious part of the transfer sequence. Every byte clocked out
+clocks a byte in, so a read is:
+
+    CS low
+    wait TXE -> write control byte -> wait RXNE -> read DR, DISCARD
+    wait TXE -> write dummy        -> wait RXNE -> read DR, KEEP
+    wait !BSY
+    CS high
+
+Skipping the discard leaves RXNE already set when the second read runs,
+so it returns the garbage byte clocked in during the address phase — and
+every subsequent transaction stays permanently off by one, returning the
+previous transaction's value. The wire traffic looks correct throughout,
+which makes this present as a hardware problem when it is not.
+
+Also note TXE goes *before* each write, not after — TXE asserts when the
+byte moves from DR into the shift register, not when it reaches the wire.
+BSY is the flag that means "transmission in progress"; polling it before
+dropping CS is what prevents truncating the last bit.
+
+---
+
+### Bug: disconnected CS
+
+DEVID read returned 0x00. State at the breakpoint:
+- `SPI1->SR = 0x2` → TXE set, RXNE clear
+- `SPI1->DR = 0x0`
+
+TXE set means the peripheral was transmitting normally, so the master
+side was working. RXNE clear with nothing on MISO points at the slave
+never responding — a power, ground, or wiring fault rather than a config
+error. The CS jumper was not connected, so the ADXL345 was never enabled
+and never drove SDO.
+
+Reconnected it; DEVID read 0xE5 immediately.
+
+**Discipline note:** this is the failure mode where the register evidence
+distinguishes "master not transmitting" from "slave not responding."
+Those are indistinguishable from the returned value alone.
+
+---
+
+### GDB hazard (second instance)
+
+`p/x SPI1->DR` from the debugger *clears RXNE* — reading DR is not a
+passive observation. Same class of problem as yesterday's PLLON poke:
+touching a peripheral register from GDB changes hardware state. Prefer
+inspecting the C variable (`p/x response`), which is a plain memory read
+with no side effects.
+
+Worth generalizing: debugger reads of peripheral registers can have the
+same side effects as reads from code, including clearing flags and
+popping FIFOs.
+
+---
+
+### CMSIS naming note
+
+`GPIOA->AFRL` does not exist. RM0383 documents AFRL and AFRH separately;
+CMSIS collapses them into `AFR[2]`, so pins 0–7 are `AFR[0]`. The bit
+macros keep the manual's naming (`GPIO_AFRL_AFSEL5_Pos`) even though the
+struct field does not — and are AFSEL, not AFRL, in current headers.
+
+Technique: grep the device header rather than guessing at macro names.
+
+---
+
+### Open / next
+
+- [ ] **Logic analyzer capture of the DEVID transaction.** Doing this
+      while the code is known-good is deliberate: if the capture
+      disagrees with the prediction (CS low, 16 clocks, MOSI 0x80 0x00,
+      MISO junk then 0xE5) then the analyzer setup is wrong, not the
+      firmware. Learning the instrument on a known signal beats learning
+      it mid-bug.
+- [ ] Move to breadboard — current jumper-to-jumper wiring leaves no room
+      to attach probes. Note breadboard parasitics will matter if SCLK is
+      later raised toward 5 MHz.
+- [ ] Factor into `bsp/spi.c` (`spi_transfer(tx, rx, len)`) and
+      `drivers/adxl345.c` (`adxl_read_reg` on top). The MB=1 burst read
+      of 0x32–0x37 is the target — six separate reads would let a new
+      sample land mid-sequence and return axes from different points in
+      time.
+- [ ] Clock verification still open. FX2LP cannot capture MCO1's 20 MHz
+      floor from a 100 MHz PLL — needs a scope. Check available scope
+      bandwidth.

@@ -16,7 +16,7 @@ set(CPU_FLAGS
 set(TARGET ${PROJECT_NAME}.elf)
 
 add_executable(${TARGET}
-    src/main.c
+    src/spi_test.c
     src/bsp/clock.c
     third_party/cmsis_device_f4/Source/Templates/gcc/startup_stm32f411xe.s
     third_party/cmsis_device_f4/Source/Templates/system_stm32f4xx.c
