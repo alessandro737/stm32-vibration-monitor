@@ -16,8 +16,14 @@ set(CPU_FLAGS
 set(TARGET ${PROJECT_NAME}.elf)
 
 add_executable(${TARGET}
-    src/spi_test.c
+    src/main.c
     src/bsp/clock.c
+    src/bsp/clock.h
+    src/bsp/board.h
+    src/drivers/spi.c
+    src/drivers/spi.h
+    src/drivers/ADXL345.c
+    src/drivers/ADXL345.h
     third_party/cmsis_device_f4/Source/Templates/gcc/startup_stm32f411xe.s
     third_party/cmsis_device_f4/Source/Templates/system_stm32f4xx.c
 )
