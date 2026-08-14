@@ -397,3 +397,65 @@ Technique: grep the device header rather than guessing at macro names.
 - [ ] Clock verification still open. FX2LP cannot capture MCO1's 20 MHz
       floor from a 100 MHz PLL — needs a scope. Check available scope
       bandwidth.
+
+      ## 2026-08-13 — SPI1 bring-up: ADXL345 DEVID read verified
+
+### Result
+SPI1 master, Mode 3 (CPOL=1/CPHA=1), BR=÷256 → 390.6 kHz off 100 MHz APB2,
+software NSS on PA4. DEVID (0x00) reads 0xE5, BW_RATE (0x2C) reads 0x0A
+(datasheet reset value). Both confirmed on the wire with a logic analyzer
+and in the register.
+
+### Instrumentation
+FX2LP clone + PulseView/fx2lafw on Windows. Zadig/WinUSB needed on two
+distinct USB IDs: 04B4:8613 (bare Cypress) and 1D50:608C (post-firmware-
+upload re-enumeration). Initial failures were a wrong driver selected in
+PulseView's device dropdown, not a driver-binding problem.
+Capture: 4 MSa/s, 1 M samples, falling-edge trigger on CS, D0=SCK D1=MOSI
+D2=CS D3=MISO.
+
+### Findings
+
+1. **ADXL345 MISO carries the previous transaction's output during the
+   address phase.** During clocks 1–8 the part cannot know the requested
+   register, and drives the prior transfer's last byte. Confirmed
+   unambiguously: MISO read 0xE5 while 0xAC (read BW_RATE) was being
+   clocked in, and 0x0A while 0x80 (read DEVID) was clocked in.
+   Implication: the driver must return byte 2. Returning byte 1 passes
+   any test where consecutive reads happen to match.
+
+2. **CS deassert was too short to sample.** Loop overhead between
+   CS_HIGH() and the next CS_LOW() was ~50–100 ns; sample period at
+   4 MSa/s is 250 ns. The decoder merged two transactions into one
+   window (80 00 B1 00). Not a decoder fault — an aliasing artifact.
+   Also marginal for the part's own state-machine reset. Added delay.
+
+3. **Intermittent single-bit read errors were an observation artifact.**
+   Saw DEVID as 0xE4 and BW_RATE as 0x0B intermittently under GDB, always
+   a bit-0 error. Hypothesised a stuck LSB (0xE5 has bit0=1 so the fault
+   would be invisible there; 0x0A has bit0=0 so it would show) — plausible
+   but wrong. A simultaneous capture showed the wire carrying 0xE5 while
+   GDB reported 0xE4 in the same transaction, relocating the fault to the
+   observation path. Logging 256 back-to-back reads to a .bss buffer and
+   dumping after the fact: **0 errors in 256**. Exact mechanism in the
+   halt/SWD-read path not isolated; not pursued further.
+
+### Method notes
+- `p/x SPI1->DR` pops the RX buffer and clears RXNE — it changes the state
+  it reports. Read program variables, not peripheral data registers.
+  Likewise SR-then-DR is the documented OVR clear sequence.
+- `volatile` stack locals were misreported by GDB at -Os; moving results
+  to file-scope statics (.bss, fixed address) resolved the DEVID mismatch.
+- A breakpoint set on a `for(volatile ...)` delay loop lands on the
+  increment and fires every iteration. `disassemble` confirmed
+  0x800028a = `adds r3, #1`.
+- Replacing single-shot breakpoint sampling with batch logging turned
+  "sometimes wrong" into a measurable rate, which is what settled it.
+
+### Open / next
+- Second confirmation run pending: free-run dump vs. a run with
+  breakpoints inside the loop, to check errors appear only in stopped
+  iterations.
+- SPI write path (POWER_CTL, DATA_FORMAT, BW_RATE) not yet implemented.
+- Third instance in this project of observation perturbing the system
+  (cf. PLLON poke during clock bring-up leaving the PLL running).

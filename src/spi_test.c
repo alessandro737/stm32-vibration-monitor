@@ -10,11 +10,17 @@
 
 #define ADXL345_WHO_AM_I 0x00
 #define ADXL345_WHO_AM_I_RESPONSE 0xE5
+#define ADXL345_BW_RATE 0x2C
 #define ADXL345_READ 0x80
 #define ADXL345_WRITE 0x00
 #define ADXL345_CS_LOW() (GPIOA->BSRR = GPIO_BSRR_BR4)
 #define ADXL345_CS_HIGH() (GPIOA->BSRR = GPIO_BSRR_BS4)
 #define ADXL345_MB_MODE 0x40
+
+static volatile uint8_t devid_result;
+static volatile uint8_t log_buf[256];
+// static volatile uint8_t bw_rate_result;
+// static volatile uint8_t bw_rate_write_result;
 
 int main(void) 
 {
@@ -42,26 +48,50 @@ int main(void)
 	// enable SPI1
 	SPI1->CR1 |= SPI_CR1_SPE;
 
-	while(1) { // read who_am_i register from ADXL345
+	volatile uint8_t garbage = 0;
+
+	for(uint16_t i = 0; i < 256; i++) { // wait for ADXL345 to power up
+
 		ADXL345_CS_LOW();
 		while(!(SPI1->SR & SPI_SR_TXE)); // wait for TXE
 		SPI1->DR = ADXL345_READ | ADXL345_WHO_AM_I; // send read command
 		while(!(SPI1->SR & SPI_SR_RXNE)); // wait for RXNE
-		volatile uint8_t garbage = SPI1->DR; // read response
+		garbage = SPI1->DR; // read response
 		while(!(SPI1->SR & SPI_SR_TXE)); // wait for TXE
 		SPI1->DR = 0x00; // send dummy byte to receive data
 		while(!(SPI1->SR & SPI_SR_RXNE)); // wait for RXNE
-		volatile uint8_t response = SPI1->DR; // read response
+		devid_result = SPI1->DR; // read response
 
 		while(SPI1->SR & SPI_SR_BSY); // wait for BSY to clear
 		ADXL345_CS_HIGH();
+		__NOP(); // small delay to avoid spamming the ADXL345 with requests
+		__NOP();
 
-		if(response == ADXL345_WHO_AM_I_RESPONSE) {
-			// successful communication with ADXL345
-			for(volatile uint32_t i = 0; i < 1000000; i++); // delay
-		} else {
-			// failed communication, handle error
-			for(volatile uint32_t i = 0; i < 9000000; i++); // delay
-		}
+		log_buf[i] = devid_result;
+		
+
+
+		
+
+		// ADXL345_CS_LOW();
+		// while(!(SPI1->SR & SPI_SR_TXE)); // wait for TXE
+		// SPI1->DR = ADXL345_WRITE | ADXL345_BW_RATE; // send write command for BW_RATE register
+		// while(!(SPI1->SR & SPI_SR_RXNE)); // wait for RXNE
+		// garbage = SPI1->DR; // read response
+		// while(!(SPI1->SR & SPI_SR_TXE)); // wait for TXE
+		// SPI1->DR = 0x0F; // send 0x0F to set BW_RATE to 0x0F (1600Hz)
+		// while(!(SPI1->SR & SPI_SR_RXNE)); // wait for RXNE
+		// bw_rate_result = SPI1->DR; // read response
+		// while(!(SPI1->SR & SPI_SR_TXE)); // wait for TXE
+		// SPI1->DR = 0x00; // send dummy byte to receive data
+		// while(!(SPI1->SR & SPI_SR_RXNE)); // wait for RXNE
+		// bw_rate_write_result = SPI1->DR; // read response
+
+		// while(SPI1->SR & SPI_SR_BSY); // wait for BSY to clear
+		// ADXL345_CS_HIGH();
+		
+
 	}
+
+	while(1);
 }
