@@ -15,6 +15,9 @@ set(CPU_FLAGS
 
 set(TARGET ${PROJECT_NAME}.elf)
 
+set(FREERTOS_DIR ${CMAKE_SOURCE_DIR}/third_party/FreeRTOS-Kernel)
+set(FREERTOS_PORT ${FREERTOS_DIR}/portable/GCC/ARM_CM4F)
+
 add_executable(${TARGET}
     src/main.c
     src/bsp/clock.c
@@ -26,6 +29,11 @@ add_executable(${TARGET}
     src/drivers/ADXL345.h
     third_party/cmsis_device_f4/Source/Templates/gcc/startup_stm32f411xe.s
     third_party/cmsis_device_f4/Source/Templates/system_stm32f4xx.c
+    ${FREERTOS_DIR}/tasks.c
+    ${FREERTOS_DIR}/list.c
+    ${FREERTOS_DIR}/queue.c
+    ${FREERTOS_PORT}/port.c
+    ${FREERTOS_DIR}/portable/MemMang/heap_4.c
 )
 
 # stm32f4xx.h uses this to select the device header. Without it: #error.
@@ -35,6 +43,9 @@ target_include_directories(${TARGET} PRIVATE
     third_party/cmsis_device_f4/Include
     third_party/CMSIS_5/CMSIS/Core/Include
     src
+    ${FREERTOS_DIR}/include
+    ${FREERTOS_PORT}
+    src/config
 )
 
 target_compile_options(${TARGET} PRIVATE
