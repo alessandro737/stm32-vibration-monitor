@@ -571,3 +571,147 @@ scratch block (0x1D–0x24) read back byte-exact: `85 8B 8D 92 94 9A 9F A0`.
 Characterization is bounded and a validated workaround is in place. Stopping
 here and moving to FreeRTOS integration, which is the critical path for the
 week. Revisit if there is slack.
+
+## 2026-08-17 — SPI1: bit 0 corruption root-caused to SCK output slew rate
+
+### Symptom
+
+ADXL345 register reads returned values whose bit 0 was wrong; bits 7:1 were
+always correct. Initially presented as "first read after init is wrong, second
+read is correct," which was misleading — reading the same register twice masks
+the defect, because the second read inherits a bit 0 that happens to be right.
+
+Logic analyzer captures showed the correct value on MISO in every case. The
+divergence was between the pin and the value in RAM.
+
+### Model
+
+Bit 0 of every received byte equals bit 0 of the **previous byte on the wire**.
+Bits 7:1 always correct.
+
+Four models scored on-target across three sequences with non-alternating,
+independently-varying bit0/bit1 patterns (out of 7):
+
+| model | seq A (write-free) | seq B (single) | seq C (burst) |
+|---|---|---|---|
+| clean | 3 | 4 | 4 |
+| **bit0 held from previous byte** | **7** | **7** | **7** |
+| bit0 inverted in place | 4 | 3 | 3 |
+| bit0 := bit1 | 4 | 3 | 3 |
+
+Sequence A read only DEVID (0xE5) and BW_RATE (0x0A) — untouched reset values,
+no write involved — and still showed the defect, exonerating the write path.
+An earlier pattern alternated bit 0 across bytes, under which "held from
+previous" and "inverted in place" are indistinguishable; that test could not
+discriminate and was rerun.
+
+### Eliminated, with evidence
+
+| hypothesis | how it died |
+|---|---|
+| Stale RX / overrun after SPE | `SR = 0x0002` (TXE set, RXNE clear, no OVR, not BSY) before every transaction, all trials |
+| First-transaction-after-init effect | Probes 0 and 1 correct; probe 4, well clear of init, wrong |
+| tCS,DIS violation / CS framing | 8-byte burst in a **single** CS assertion corrupted on every byte |
+| Baud-rate timing race | Byte-identical at BR=7/5/3 (~390 kHz, 1.56 MHz, 6.25 MHz) |
+| Lost SCK edge / bit-count error | Analyzer: 8 pulses/byte, 16/transaction. Also excluded by bits 7:1 always being correct |
+| DR access width | `strb`/`ldrb` and word-read-plus-`uxtb` gave bit-identical results |
+| TXE/RXNE pipeline overlap | Full BSY wait between transactions changed nothing |
+| SPI misconfiguration | `CR1 = 0x37F` by readback (CPHA/CPOL/MSTR/SPE/SSI/SSM set, BR=111, DFF=0, LSBFIRST=0, RXONLY=0, BIDIMODE=0); `CR2 = 0x0000` |
+
+### Root cause
+
+**`GPIOA->OSPEEDR` was left at its reset value of `00` (lowest slew rate) for
+PA5 = SPI1_SCK.**
+
+Slow SCK slew delays the clock edge arriving at the ADXL345. The sensor shifts
+MISO on that delayed edge, so its response returns after the STM32 has already
+sampled on its own internal, undelayed edge — the sampler captures the previous
+bit. One bit of lag, appearing at the last bit sampled in each byte.
+
+Isolated to a single pin by elimination:
+
+| OSPEEDR configuration | result |
+|---|---|
+| all pins at reset (`00`) | corrupted, stale-hold 7/7 |
+| PA7 (MOSI) only at `11` | corrupted, stale-hold 7/7 |
+| PA5 (SCK) + PA7 at `11` | clean 7/7 all sequences |
+| **PA5 (SCK) only at `11`** | **clean 7/7 all sequences** |
+
+PA6 = MISO is irrelevant, as expected: in master mode it is an input and its
+output driver is disabled, so slew configuration has no effect.
+
+Shipped with PA5 and PA7 at `11`. The minimum sufficient setting for SCK was
+not characterized — `01` or `10` may well suffice, and the slowest working
+setting is the better choice on a breadboard (less ringing and EMI). Left as an
+open item rather than a justified decision.
+
+### Verification
+
+All corrective workarounds removed. Post-fix, with plain 2-transfer reads:
+
+- `logA` = `E5 E5 0A 0A E5 0A E5 E5`, clean 7/7
+- `logB` = `85 8B 8D 92 94 9A 9F A0` (byte-exact against seeded block), clean 7/7
+- `logC` = same, via the burst path, clean 7/7
+- Live acceleration, board flat, ±2g / 10-bit: X=10, Y=34, Z=−216. Z magnitude
+  slightly under the 256 LSB/g nominal — normal part offset/gain error, and what
+  OFSX/OFSY/OFSZ exist to trim. Not yet calibrated.
+
+### What made this hard
+
+**Frequency-independence was misread as ruling out timing.** Identical results
+across a 16× baud sweep looked like proof that no race was involved. Wrong
+inference: slew delay is roughly fixed per *edge* and does not scale with the
+bit period, so a fixed-position sampling edge misses a slow-arriving level
+identically at every baud rate. This single bad inference cost most of the day
+and steered the investigation away from the actual cause.
+
+**The logic analyzer structurally could not show this.** At 8 MSa/s it
+quantizes to clean logic levels, and the *value* on MISO was always correct.
+What was wrong was arrival *time* relative to a sampling edge. That is a
+scope-class measurement; a logic analyzer will report a late-but-valid level as
+valid. Every capture taken today was accurate and every one was misleading.
+
+**Loopback (MOSI jumpered to MISO) reproduced the signature but is not a
+faithful model.** Tying output to input creates a near-zero-delay path from the
+transmit shift register to the receive sampler, so it can reproduce a matching
+symptom by a different route. It correctly proved the sensor and breakout were
+not required — the defect was MCU-side — but the mechanism it exhibits is not
+the sensor-path mechanism, and the PA7-only result later showed MOSI slew was
+irrelevant with a real slave.
+
+**Identical `.text` size is not proof of an identical binary.** Twice today a
+real code change left every section size unchanged (absorbed by existing
+alignment padding, or because only constants changed). Verify with `objdump -d`
+or by reading the peripheral register, not by section sizes.
+
+### Method notes
+
+- **Let the target compute the verdict.** Firmware scored the competing models
+  itself and exported single-byte answers, removing the debugger from the
+  measurement path. GDB's report and the CPU's value are separate observation
+  sites and were being conflated.
+- **Poison initializers.** Statics set to `0xAA`/`0xFFFF` rather than zero, so
+  "genuine zero" and "never written" are distinguishable. Also confirmed startup
+  copies `.data` from flash to RAM.
+- **Read the register, don't infer the configuration.** `p/x GPIOA->OSPEEDR`
+  settled a stale-binary question in one command. Reset value is `0x0C000000` —
+  bits 27:26 are PA13/SWDIO, set by the debug port, not by application code.
+- **MCU reset does not reset the ADXL345.** The 3.3V rail stays up through
+  `monitor reset halt`, so the sensor retains state across runs. Cold sensor
+  trials require a USB power cycle; cold and warm trials must be labeled.
+- **Don't halt inside a transaction.** Single-stepping holds CS asserted for
+  however long you take, invalidating the capture.
+
+### Open
+
+- Minimum sufficient OSPEEDR value for SCK not characterized.
+- ADXL345 offset registers not calibrated.
+- Analyzer captures in `captures/` predate the fix and show the *correct*
+  wire values — worth keeping precisely because they demonstrate why the
+  instrument could not see this.
+
+### Attribution
+
+OSPEEDR was never in the hypothesis list. Seven proposed mechanisms were
+eliminated with evidence and none was correct; the actual cause was found
+independently after that list was exhausted.

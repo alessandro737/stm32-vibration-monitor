@@ -47,15 +47,15 @@ void adxl345_init(void)
 
 uint8_t adxl345_read_register(uint8_t reg)
 {
-    uint8_t v, tail;
+    uint8_t v;
     adxl345_cs_low();
     spi1_transfer(ADXL345_CMD_READ | (reg & 0x3F));
-    v    = spi1_transfer(0x00);   /* bits 7:1 valid, bit 0 stale */
-    tail = spi1_transfer(0x00);   /* bit 0 == v's true bit 0     */
+    v = spi1_transfer(0x00); 
     spi1_wait_idle();
     adxl345_cs_high();
-    return (uint8_t)((v & 0xFE) | (tail & 0x01));
+    return v;
 }
+
 
 
 void adxl345_write_register(

@@ -44,6 +44,21 @@ void spi1_init(void)
         (5U << GPIO_AFRL_AFSEL6_Pos) |
         (5U << GPIO_AFRL_AFSEL7_Pos);
 
+    /*
+     * Configure GPIO speed to Very High Speed for SPI pins (PA5, PA6, PA7).
+     * This prevents the LSB/bit 0 from lagging behind the internal peripheral clock.
+     */
+    GPIOA->OSPEEDR &= ~(
+        GPIO_OSPEEDR_OSPEED5 |
+        GPIO_OSPEEDR_OSPEED6 |
+        GPIO_OSPEEDR_OSPEED7
+    );
+
+    GPIOA->OSPEEDR |=
+        GPIO_OSPEEDR_OSPEED5_1 | GPIO_OSPEEDR_OSPEED5_0;  // Very High Speed
+        // GPIO_OSPEEDR_OSPEED7_1 | GPIO_OSPEEDR_OSPEED7_0;  // Very High Speed
+
+
 
     /*
      * ---------------------------------------------------------
@@ -99,33 +114,6 @@ void spi1_init(void)
     SPI1->CR1 |= SPI_CR1_SPE;
 }
 
-
-uint8_t spi1_transfer(uint8_t data)
-{
-    /*
-     * Wait until transmit buffer is empty.
-     */
-    while (!(SPI1->SR & SPI_SR_TXE))
-        ;
-
-    /*
-     * Explicit 8-bit access to DR.
-     */
-    *((volatile uint8_t *)&SPI1->DR) = data;
-
-    /*
-     * Wait until received byte is available.
-     */
-    while (!(SPI1->SR & SPI_SR_RXNE))
-        ;
-
-    /*
-     * Explicit 8-bit read from DR.
-     */
-    return (uint8_t)(SPI1->DR & 0xFFU);
-}
-
-
 void spi1_wait_idle(void)
 {
     while (SPI1->SR & SPI_SR_BSY)
@@ -147,4 +135,32 @@ void spi1_flush_rx(void)
      * Read SR after DR to clear OVR if necessary.
      */
     (void)SPI1->SR;
+}
+
+
+uint8_t spi1_transfer(uint8_t data)
+{
+    /*
+     * Wait until transmit buffer is empty.
+     */
+    while (!(SPI1->SR & SPI_SR_TXE))
+        ;
+
+    /*
+     * Explicit 8-bit access to DR.
+     */
+    *((volatile uint8_t *)&SPI1->DR) = data;
+
+    spi1_wait_idle();
+
+    /*
+     * Wait until received byte is available.
+     */
+    while (!(SPI1->SR & SPI_SR_RXNE))
+        ;
+
+    /*
+     * Explicit 8-bit read from DR.
+     */
+    return (uint8_t)(SPI1->DR & 0xFFU);
 }
