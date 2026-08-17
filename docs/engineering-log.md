@@ -459,3 +459,115 @@ D2=CS D3=MISO.
 - SPI write path (POWER_CTL, DATA_FORMAT, BW_RATE) not yet implemented.
 - Third instance in this project of observation perturbing the system
   (cf. PLLON poke during clock bring-up leaving the PLL running).
+
+## 2026-08-17 — SPI1 receive path: bit 0 carries previous byte (characterized, not root-caused)
+
+### Symptom
+
+Register reads from the ADXL345 returned values whose bit 0 was wrong, while
+bits 7:1 were always correct. Presented initially as "first read after init is
+wrong, second read is correct" — which was misleading. Reading the same
+register twice masks the defect, because the second read inherits a bit 0 that
+happens to be correct.
+
+Analyzer captures showed the correct value on MISO in every case. The
+divergence is between the pin and the value in RAM.
+
+### Model
+
+Bit 0 of every received byte equals bit 0 of the **previous byte on the wire**.
+Bits 7:1 are always correct.
+
+Scored four competing models on-target across three independent sequences with
+non-alternating LSB orderings (out of 7):
+
+| model | seq A (write-free) | seq B (single) | seq C (burst) |
+|---|---|---|---|
+| clean | 3 | 4 | 4 |
+| **bit0 held from previous byte** | **7** | **7** | **7** |
+| bit0 inverted in place | 4 | 3 | 3 |
+| bit0 := bit1 | 4 | 3 | 3 |
+
+Sequence A read only DEVID (0x00 → 0xE5) and BW_RATE (0x2C → 0x0A), both
+untouched reset values, so no write occurs. It still showed the defect. The
+write path is exonerated; this is read-path only. MOSI carried 0x80 correctly
+on the analyzer, consistent with that.
+
+An earlier pattern choice alternated bit 0 across bytes (1,0,1,0,...), under
+which "held from previous" and "inverted in place" produce identical output.
+That test could not discriminate and was rerun with independent bit 0 / bit 1
+variation.
+
+### Eliminated, with evidence
+
+| hypothesis | how it died |
+|---|---|
+| Stale RX byte / overrun after SPE | `SPI1->SR` read 0x0002 (TXE set, RXNE clear, no OVR, not BSY) immediately before every transaction, all trials |
+| First-transaction-after-init effect | Probes 0 and 1 of the 7-probe run were correct; probe 4, well clear of init, was wrong |
+| tCS,DIS violation (250 ns min, ADXL345 DS) / CS framing | Burst read of 8 bytes in a **single** CS assertion showed identical corruption on every byte — no CS transitions involved |
+| Baud-rate timing race | Byte-identical results at BR=7/5/3 → ~390 kHz, 1.56 MHz, 6.25 MHz. 16× span, zero change |
+| Lost SCK edge / bit-count error | Analyzer: 8 SCK pulses per byte, 16 per register read. Also ruled out by bits 7:1 always being correct — a shift would corrupt the upper bits |
+| DR access-width (byte-lane vs halfword) | `strb`/`ldrb` and word-read-plus-`uxtb` produced bit-identical results |
+| SPI misconfiguration | `CR1 = 0x37F` verified by readback: CPHA=1, CPOL=1, MSTR=1, BR=111, SPE=1, LSBFIRST=0, SSI=1, SSM=1, DFF=0, RXONLY=0, BIDIMODE=0. `CR2 = 0x0000` (no TI frame format, no DMA) |
+
+### Workaround
+
+The model is predictive, so it is also correctable. Clock one extra dummy byte
+after the data byte; its bit 0 is the data byte's true bit 0:
+
+```c
+v    = spi1_transfer(0x00);   /* bits 7:1 valid, bit 0 stale */
+tail = spi1_transfer(0x00);   /* bit 0 == v's true bit 0     */
+return (uint8_t)((v & 0xFE) | (tail & 0x01));
+```
+
+Verified: `logA` = `E5 E5 0A 0A E5 0A E5 E5`, clean-model score 7/7. Seeded
+scratch block (0x1D–0x24) read back byte-exact: `85 8B 8D 92 94 9A 9F A0`.
+
+**Cost:** 3 transfers per register read instead of 2 — 24 SCK cycles instead of
+16, 50% more bus time. Relevant against the 10 ms acquisition deadline.
+
+### Open
+
+- **Mechanism unknown.** A validated corrective model is not a root cause. What
+  survives is something in the receive path holding the final sampled bit;
+  there is no explanation for a shift register that shifts 7 stages and holds
+  the 8th.
+- **`adxl345_read_multiple_registers` is still uncorrected** and is the path
+  acceleration data will use. Every byte in a burst is simultaneously data and
+  its successor's predecessor, so the fix is to read N+1 bytes and reassemble —
+  byte *i*'s true bit 0 arrives with byte *i+1*. Note this corrupts bit 8 of
+  each 16-bit sample (DATAX1 etc.), a 256-LSB error, not a rounding nuisance.
+- Next diagnostic if revisited: compare against a second ADXL345 or a different
+  SPI slave to separate MCU-side from board/sensor-side.
+
+### Method notes
+
+- **Let the target compute the verdict.** GDB's report and the CPU's value are
+  different observation sites. Firmware scored the models itself and exported
+  single-byte answers, which removed the debugger from the measurement.
+- **Poison initializers.** Statics initialized to `0xAA`/`0xFFFF` instead of
+  zero, so "genuine zero" and "never written" are distinguishable. Side benefit:
+  confirmed startup copies `.data` from flash to RAM.
+- **MCU reset does not reset the ADXL345.** The 3.3V rail stays up through
+  `monitor reset halt`, so the sensor retains state from the previous run. Cold
+  sensor trials require a USB power cycle. Cold and warm trials must be labeled.
+- **Identical `.text` size is not proof of an identical binary.** A byte-lane to
+  word-read change was absorbed by existing alignment padding. Verify with
+  `objdump -d`, not section sizes.
+- **Don't halt inside a transaction.** Single-stepping holds CS asserted for
+  however long you take, which invalidates the capture.
+
+### Artifacts
+
+- `docs/captures/spi_devid_pair.png` — two consecutive DEVID reads. MOSI `80 00`
+  both times; MISO `00 E5` then `E5 E5`. The address-phase byte differs (0x00,
+  then 0xE5) because the sensor still drives the previous value. RAM held 0xE4
+  then 0xE5 — the delta is fully accounted for by the preceding byte's bit 0.
+- `docs/captures/spi_clock_count.png` — 8 SCK pulses per byte confirmed.
+
+### Decision
+
+Characterization is bounded and a validated workaround is in place. Stopping
+here and moving to FreeRTOS integration, which is the critical path for the
+week. Revisit if there is slack.

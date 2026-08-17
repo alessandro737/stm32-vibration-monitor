@@ -1,8 +1,4 @@
-/*
- * clock.c
- *      Author: alessandro
- */
-
+//clock.c
 #include <stm32f4xx.h>
 #include "bsp/clock.h"
 
