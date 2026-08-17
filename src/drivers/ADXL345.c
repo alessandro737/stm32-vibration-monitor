@@ -31,9 +31,6 @@ void adxl345_init(void)
     ADXL345_CS_PORT->MODER |=
         (1U << (ADXL345_CS_PIN * 2U));
 
-    // Delay; TODO: test without delay
-    for (volatile uint32_t i = 0; i < 100000; i++)
-        ;
 }
 
 
