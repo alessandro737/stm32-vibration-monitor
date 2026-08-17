@@ -22,24 +22,16 @@ static inline void adxl345_cs_high(void)
 
 void adxl345_init(void)
 {
-    /*
-     * CS inactive.
-     */
     adxl345_cs_high();
 
-    /*
-     * Configure CS as GPIO output.
-     */
-
+    // Config CS GPIO
     ADXL345_CS_PORT->MODER &=
         ~(3U << (ADXL345_CS_PIN * 2U));
 
     ADXL345_CS_PORT->MODER |=
         (1U << (ADXL345_CS_PIN * 2U));
 
-    /*
-     * Give the device a little time after power-up.
-     */
+    // Delay; TODO: test without delay
     for (volatile uint32_t i = 0; i < 100000; i++)
         ;
 }
@@ -58,10 +50,7 @@ uint8_t adxl345_read_register(uint8_t reg)
 
 
 
-void adxl345_write_register(
-    uint8_t reg,
-    uint8_t value
-)
+void adxl345_write_register(uint8_t reg, uint8_t value)
 {
     adxl345_cs_low();
 
@@ -78,11 +67,7 @@ void adxl345_write_register(
 }
 
 
-void adxl345_read_multiple_registers(
-    uint8_t reg,
-    uint8_t *buffer,
-    uint8_t length
-)
+void adxl345_read_multiple_registers(uint8_t reg, uint8_t *buffer, uint8_t length)
 {
     adxl345_cs_low();
 
@@ -103,9 +88,7 @@ void adxl345_read_multiple_registers(
 }
 
 
-void adxl345_read_acceleration(
-    ADXL345_Accel *accel
-)
+void adxl345_read_acceleration(ADXL345_Accel *accel)
 {
     uint8_t buffer[6];
 

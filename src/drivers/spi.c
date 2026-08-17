@@ -4,19 +4,9 @@
 
 void spi1_init(void)
 {
-    /*
-     * ---------------------------------------------------------
-     * GPIO
-     * ---------------------------------------------------------
-     */
+    // GPIO Configuration for SPI1 pins (PA5, PA6, PA7) (SCK, MISO, MOSI)
 
     RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
-
-    /*
-     * PA5 = SPI1_SCK
-     * PA6 = SPI1_MISO
-     * PA7 = SPI1_MOSI
-     */
 
     GPIOA->MODER &= ~(
         GPIO_MODER_MODER5 |
@@ -29,10 +19,7 @@ void spi1_init(void)
         GPIO_MODER_MODER6_1 |
         GPIO_MODER_MODER7_1;
 
-    /*
-     * AF5 = SPI1
-     */
-
+    // AF5 = SPI1
     GPIOA->AFR[0] &= ~(
         GPIO_AFRL_AFSEL5 |
         GPIO_AFRL_AFSEL6 |
@@ -45,32 +32,20 @@ void spi1_init(void)
         (5U << GPIO_AFRL_AFSEL7_Pos);
 
     /*
-     * Configure GPIO speed to Very High Speed for SPI pins (PA5, PA6, PA7).
-     * This prevents the LSB/bit 0 from lagging behind the internal peripheral clock.
+     * SCK slew rate. At reset (00) the clock edge arrives at the sensor late enough
+     * that its MISO response misses our sampling edge; see engineering log 2026-08-17
      */
     GPIOA->OSPEEDR &= ~(
         GPIO_OSPEEDR_OSPEED5 |
-        GPIO_OSPEEDR_OSPEED6 |
         GPIO_OSPEEDR_OSPEED7
     );
 
     GPIOA->OSPEEDR |=
-        GPIO_OSPEEDR_OSPEED5_1 | GPIO_OSPEEDR_OSPEED5_0;  // Very High Speed
-        // GPIO_OSPEEDR_OSPEED7_1 | GPIO_OSPEEDR_OSPEED7_0;  // Very High Speed
+        GPIO_OSPEEDR_OSPEED5_1 | GPIO_OSPEEDR_OSPEED5_0 |  // Very High Speed
+        GPIO_OSPEEDR_OSPEED7_1 | GPIO_OSPEEDR_OSPEED7_0;  // Very High Speed
 
-
-
-    /*
-     * ---------------------------------------------------------
-     * SPI1 peripheral
-     * ---------------------------------------------------------
-     */
-
+    // SPI1 Peripheral Clock Enable and Configuration
     RCC->APB2ENR |= RCC_APB2ENR_SPI1EN;
-
-    /*
-     * Disable SPI before configuring CR1.
-     */
     SPI1->CR1 = 0;
 
     /*
@@ -95,22 +70,13 @@ void spi1_init(void)
         SPI_CR1_SSI  |
         (7U << SPI_CR1_BR_Pos);
 
-    /*
-     * 8-bit data size is the reset/default configuration.
-     *
-     * Explicitly clear DFF to guarantee 8-bit transfers.
-     */
-    SPI1->CR1 &= ~SPI_CR1_DFF;
+    SPI1->CR1 &= ~SPI_CR1_DFF; // 8-bit data frame format
 
-    /*
-     * Clear any stale receive data / overrun state.
-     */
+    // clear any stale data in the RX FIFO and clear OVR flag if set
     (void)SPI1->DR;
     (void)SPI1->SR;
 
-    /*
-     * Enable SPI.
-     */
+    // Enable SPI1
     SPI1->CR1 |= SPI_CR1_SPE;
 }
 
@@ -123,44 +89,27 @@ void spi1_wait_idle(void)
 
 void spi1_flush_rx(void)
 {
-    /*
-     * If RXNE is set, consume the stale byte.
-     */
-    while (SPI1->SR & SPI_SR_RXNE)
+    
+    while (SPI1->SR & SPI_SR_RXNE) // while RXNE is set, read data to clear it
     {
         (void)*((volatile uint8_t *)&SPI1->DR);
     }
 
-    /*
-     * Read SR after DR to clear OVR if necessary.
-     */
-    (void)SPI1->SR;
+    (void)SPI1->SR; // read SR to clear OVR flag if set
 }
 
 
 uint8_t spi1_transfer(uint8_t data)
 {
-    /*
-     * Wait until transmit buffer is empty.
-     */
-    while (!(SPI1->SR & SPI_SR_TXE))
+    while (!(SPI1->SR & SPI_SR_TXE)) // wait until TXE is set
         ;
 
-    /*
-     * Explicit 8-bit access to DR.
-     */
-    *((volatile uint8_t *)&SPI1->DR) = data;
+    *((volatile uint8_t *)&SPI1->DR) = data; // write data to DR (8-bit access)
 
-    spi1_wait_idle();
+    spi1_wait_idle(); // wait until BSY is cleared
 
-    /*
-     * Wait until received byte is available.
-     */
-    while (!(SPI1->SR & SPI_SR_RXNE))
+    while (!(SPI1->SR & SPI_SR_RXNE)) // wait until RXNE is set
         ;
 
-    /*
-     * Explicit 8-bit read from DR.
-     */
-    return (uint8_t)(SPI1->DR & 0xFFU);
+    return (uint8_t)(SPI1->DR & 0xFFU);          /* word read, mask */
 }
