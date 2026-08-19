@@ -715,3 +715,118 @@ or by reading the peripheral register, not by section sizes.
 OSPEEDR was never in the hypothesis list. Seven proposed mechanisms were
 eliminated with evidence and none was correct; the actual cause was found
 independently after that list was exhausted.
+
+## 2026-08-19 — FreeRTOS configuration
+
+### Goal
+Produce a defensible FreeRTOSConfig.h for the F411RE and clear any
+blockers before the two-task blink checkpoint.
+
+### Design decisions
+
+**Task decomposition.** Two tasks, split by independent timing domain
+rather than by blocking call. Acquisition runs on a period set by the
+sensor; the logger runs on a period set by buffer fill and flash
+latency. The test for whether two candidates are really two tasks:
+would merging them into one sequential function break a deadline? Here
+yes, because flash erase stalls for up to 400 ms against a 10 ms
+sample period.
+
+**Priority assignment: rate monotonic.** Shortest *period* gets highest
+priority — not shortest execution time. Acquisition (10 ms) outranks
+the logger (hundreds of ms). Utilization is around 5% against the
+two-task RM bound of 82.8%, so the schedulability check is not close
+to binding.
+
+Set configMAX_PRIORITIES=5 to accommodate a medium-priority CPU hog at
+level 2. That task is not filler — unbounded priority inversion
+requires a task that can preempt the mutex holder, so without a level
+between acquisition and logger there is nothing to demonstrate.
+configUSE_TIMERS=0 partly to avoid the timer service task landing on
+that same level.
+
+**Static allocation.** Every task, queue, and mutex is created once at
+startup and never deleted, so a heap buys nothing. Setting
+configSUPPORT_DYNAMIC_ALLOCATION=0 turns an accidental allocation into
+a link error rather than a runtime dependency, and every byte of RAM
+becomes a named symbol in the map file instead of hiding inside one
+opaque heap array. Obligates vApplicationGetIdleTaskMemory, since the
+kernel has no way to obtain the idle task's TCB and stack itself.
+
+**configCPU_CLOCK_HZ = SystemCoreClock.** Read at runtime inside
+xPortStartScheduler when it computes the SysTick reload. This creates
+an ordering dependency — clock_init() and SystemCoreClockUpdate() must
+precede vTaskStartScheduler(). If SystemCoreClock still held its 16 MHz
+reset value, every delay in the system would run 6.25x fast with
+nothing crashing. Same class of silent-wrongness that
+SystemCoreClockUpdate() was chosen to catch during clock bringup.
+
+### Concepts clarified
+
+**Mutex vs. binary semaphore.** Not a scalar difference. A mutex has
+ownership (only the taker may give it back) and priority inheritance;
+a binary semaphore has neither. Priority inheritance is a temporary,
+targeted loan — the kernel raises the *holder* to the *blocker's*
+priority until release, so the holder finishes and lets go fast. It is
+not "tasks share a priority." Signaling → semaphore. Locking → mutex.
+
+Important limit: inheritance does not fix a holder that simply holds
+too long. It only bounds the case where a medium-priority task
+preempts the holder.
+
+**Critical section scoping.** The shared resource is the SPI peripheral
+and the three wires — not the flash chip's internal state. During a
+sector erase the pins are electrically idle while the chip grinds
+internally. Holding the mutex across the erase-and-poll loop conflates
+"my operation isn't finished" with "the shared resource is in use,"
+and blocks acquisition for up to 400 ms. Scoping the lock to each
+transaction drops that to microseconds. Generalizes to I2C EEPROM
+write cycles, SD card busy signaling, and any DMA transfer (hold while
+setting up, not while waiting for completion).
+
+**Tick rate vs. CPU clock.** configTICK_RATE_HZ is the resolution of
+time-based *blocking*, not a clock speed. SysTick reload =
+configCPU_CLOCK_HZ / configTICK_RATE_HZ; the core still runs at
+100 MHz between ticks. Tick rate does not limit sampling rate — a
+hardware interrupt fires independently of it — but it does quantize
+xTaskDelayUntil wake times, which is the concrete argument for
+hardware-triggered sampling over delay-based sampling.
+
+**Two preemption paths.** Event-driven (an API call or ISR readies a
+higher-priority task → switch immediately, microseconds) and
+time-driven (tick discovers an expired delay → switch in the tick
+handler, quantized to the tick). Different mechanisms, different
+latency numbers. Needs distinguishing when interpreting scope traces.
+
+**Handler wiring.** The Cortex-M vector table is an array of addresses;
+the hardware knows no names. The startup file fills slots 11/14/15
+with SVC_Handler / PendSV_Handler / SysTick_Handler. port.c defines
+its handlers under FreeRTOS names. The config #defines rename
+FreeRTOS's functions *to* the CMSIS names at compile time, so port.c's
+strong definitions override the startup file's weak aliases.
+
+### Verification
+- grep across src/: no SysTick references outside the config #define.
+- Startup file (Templates/gcc/startup_stm32f411xe.s) declares
+  SysTick/PendSV/SVC as .weak aliases to Default_Handler — no
+  duplicate-symbol conflict with port.c.
+- Kernel is V11.x (prvCreateIdleTasks references configNUMBER_OF_CORES
+  and prvPassiveIdleTask). Confirmed vApplicationGetIdleTaskMemory's
+  third parameter is configSTACK_DEPTH_TYPE*, which resolves to
+  uint32_t on this port — matched the declared type rather than the
+  currently-resolved one, since older kernels defaulted it to uint16_t
+  and a mismatch there writes 4 bytes through a 2-byte pointer.
+
+### Open items
+- SPI test main.c to be replaced; spi.c and ADXL345.c temporarily out
+  of the build to isolate the blink milestone.
+- PA5 conflict: LD2 shares the pin with SPI1_SCK. Needs a different
+  GPIO for per-task instrumentation once SPI returns.
+- Bring-up delay function: kernel now owns SysTick. Needs a spin-delay
+  for pre-scheduler init, and TIM2 (32-bit, free-running, no ISR) for
+  microsecond timestamping during measurement.
+
+### Next
+Two-task blink with xTaskCreateStatic. Acceptance: both LEDs blink at
+independent rates, `p xTickCount` in GDB advances ~1000/sec, `bt` from
+a task breakpoint shows a sane stack. No SPI until all three pass.

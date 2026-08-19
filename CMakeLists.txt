@@ -20,20 +20,19 @@ set(FREERTOS_PORT ${FREERTOS_DIR}/portable/GCC/ARM_CM4F)
 
 add_executable(${TARGET}
     src/main.c
+    src/FreeRTOSHooks.c
     src/bsp/clock.c
-    src/bsp/clock.h
-    src/bsp/board.h
     src/drivers/spi.c
-    src/drivers/spi.h
     src/drivers/ADXL345.c
-    src/drivers/ADXL345.h
     third_party/cmsis_device_f4/Source/Templates/gcc/startup_stm32f411xe.s
     third_party/cmsis_device_f4/Source/Templates/system_stm32f4xx.c
     ${FREERTOS_DIR}/tasks.c
     ${FREERTOS_DIR}/list.c
     ${FREERTOS_DIR}/queue.c
     ${FREERTOS_PORT}/port.c
-    ${FREERTOS_DIR}/portable/MemMang/heap_4.c
+    ${FREERTOS_DIR}/timers.c
+    ${FREERTOS_DIR}/event_groups.c
+    ${FREERTOS_DIR}/stream_buffer.c
 )
 
 # stm32f4xx.h uses this to select the device header. Without it: #error.
