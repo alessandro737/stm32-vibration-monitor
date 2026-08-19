@@ -830,3 +830,142 @@ strong definitions override the startup file's weak aliases.
 Two-task blink with xTaskCreateStatic. Acceptance: both LEDs blink at
 independent rates, `p xTickCount` in GDB advances ~1000/sec, `bt` from
 a task breakpoint shows a sane stack. No SPI until all three pass.
+
+## 2026-08-19 (evening) — Two-task blink checkpoint
+
+### Goal
+Prove the kernel starts, switches, and keeps time before adding any
+driver code. Isolating this from SPI means any failure here is a config
+failure, not a design failure.
+
+### What broke first
+The V11 kernel #errors on missing configUSE_IDLE_HOOK and
+configUSE_TICK_HOOK rather than defaulting them. Initially read as an
+annoyance; on reflection it is the right call — an application-provided
+hook is not something a kernel should assume the absence of, since a
+silently-disabled hook would be a much worse failure than a compile
+error. Same philosophy as configASSERT.
+
+Also had to add timers.c, event_groups.c, and stream_buffer.c to the
+build despite configUSE_TIMERS=0. tasks.c references symbols from them
+regardless; --gc-sections removes the dead code, so the cost is zero.
+
+### GPIO init ordering
+Between reset and led_init(), PA8/PB10 are high-impedance inputs. The
+moment MODER switches them to output they drive whatever ODR holds —
+reset value 0, which for active-low wiring means *on*. Writing BSRR
+before MODER parks the desired value so it takes effect the instant the
+pin becomes an output, eliminating the glitch.
+
+Microseconds and invisible on an LED, but the same pattern matters for
+chip selects (a CS glitching low can put a device into an unexpected
+state) and anything driving a relay or MOSFET. Worth doing correctly
+here so the habit is in place where it counts.
+
+Slew rate deliberately left at reset value. This is the inverse of the
+SPI1_SCK bug: there the default was mismatched to the requirement
+because edge time was a meaningful fraction of a 2.5 us bit period.
+For an LED at 1 Hz, edge time is irrelevant and the slowest setting is
+strictly better — less di/dt, less ringing, less EMI. Same register,
+opposite conclusion, because the signal's requirement differs.
+
+### One task function, two instances
+Rather than two near-identical functions, one blink_task parameterized
+by a config struct passed through pvParameters. The kernel passes a
+single untyped void* through untouched; the task owns the cast. Same
+callback idiom as qsort's comparator.
+
+Lifetime is the trap: vTaskStartScheduler() never returns, so main's
+stack frame is abandoned. A non-static local config would leave both
+tasks dereferencing memory that has been repurposed as someone else's
+stack — silent corruption, hard to trace. static const puts them in
+.rodata.
+
+### On-target verification
+
+**Tick rate.** xTickCount 71422 -> 72490 over roughly one second =
+1068 ticks. Within reaction-time error of 1 kHz. This is the check that
+matters, because a configCPU_CLOCK_HZ mismatch does not crash anything —
+it would just make every delay in the system proportionally wrong. If
+SystemCoreClock had still held its 16 MHz reset value, the count would
+have been ~6400.
+
+**Task identity.** A breakpoint in the loop body hits alternately with
+pvParameters=0x800161c <green_cfg> and 0x8001610 <red_cfg>. Note the
+first attempt set the breakpoint on the prologue line (the cfg
+assignment), which executes once per task at startup and had already
+passed — the breakpoint never hit. Set breakpoints inside the loop, not
+in the one-shot prologue.
+
+**Backtrace.** GDB reports "previous frame identical to this frame
+(corrupt stack?)" with a bogus uxListRemove frame beneath the task.
+This is expected on every FreeRTOS task, forever: a task has no caller.
+port.c synthesizes a fake exception frame at stack creation so the
+first context switch can "return" into the task, and there is nothing
+beneath it. The unwinder grabs whatever word is there — confirmed by
+finding 0x08000ed5 (uxListRemove+1) as a stale value near the top of
+the stack. Frame #0 is correct; the rest is GDB guessing.
+
+**Stack usage.** uxTaskGetStackHighWaterMark was unavailable in GDB —
+--gc-sections stripped it since nothing calls it. Read the fill pattern
+directly instead: method-2 overflow checking fills stacks with
+0xa5a5a5a5 at creation, so the transition marks the high water line.
+
+Deepest touched word at index 103 of 128 => ~25 words (~100 B) peak,
+~412 B free. Usage is not a solid block — there are 0xa5a5a5a5 gaps
+above the deepest point, since alignment padding and unwritten slots
+get skipped. High water mark is deepest penetration, not count of
+dirty words.
+
+Also visible at the deep end: 0x000001f4 = 500 decimal, the green
+task's period_ms spilled during the vTaskDelay call chain. That call
+is the deepest path in the task.
+
+**Saved context, read directly off the stack:**
+
+0xfffffffd EXC_RETURN (software-saved by port.c)
+0x00000000 r0
+0x20000228 r1
+0x10000000 r2
+0xe000e000 r3 (SCS base)
+0x000132a4 r12
+0x08000d09 LR
+0x08000d44 PC
+0x61000000 xPSR (bit 24 Thumb, top nibble NZCV)
+
+0xFFFFFFFD decodes as: return to Thread mode, use PSP, *basic* frame.
+Confirms tasks run on the process stack, and that lazy FPU stacking
+never fired because nothing here touches float. A float-using task
+would show 0xFFFFFFED with the frame 18 words larger — which is the
+concrete reason to budget +35 words for any task doing floating point,
+including indirectly via printf("%f").
+
+### Baselines recorded
+- RAM 4120 B / 128 KB (3.14%): two 512 B task stacks, idle's 1 KB,
+  TCBs, kernel bookkeeping. Every byte traceable in the map file — the
+  practical payoff of static allocation over a heap array.
+- Flash 5716 B / 512 KB (1.09%)
+- Task stack peak: ~25 words for GPIO write + vTaskDelay
+
+Sizing basis for the real tasks: acquisition adds a SPI transfer and a
+queue send, so budget 60-80 words and round to 128. Logger needs more
+if it holds a page buffer — that goes in static storage, not on the
+stack.
+
+### Config surface now validated against hardware
+Vector table and CMSIS handler renaming, SysTick reload derived from
+SystemCoreClock, static allocation with vApplicationGetIdleTaskMemory,
+task creation, pvParameters plumbing, preemptive context switching.
+None of this is assumed any more.
+
+### Next
+1. Restore spi.c / ADXL345.c to the build.
+2. Convert green task to acquisition at 10 ms with xTaskDelayUntil.
+   Toggle a GPIO on entry/exit and measure the actual period on the
+   logic analyzer — establishes the measurement rig before any mutex
+   exists to complicate the trace.
+3. Only then add the logger task and the SPI mutex.
+
+Open: PA5 conflict (LD2 vs SPI1_SCK) still needs resolving for
+instrumentation pins. TIM2 free-running for microsecond timestamps not
+yet set up.
