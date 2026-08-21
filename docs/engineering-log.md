@@ -969,3 +969,117 @@ None of this is assumed any more.
 Open: PA5 conflict (LD2 vs SPI1_SCK) still needs resolving for
 instrumentation pins. TIM2 free-running for microsecond timestamps not
 yet set up.
+
+## 2026-08-19 (late) — Acquisition task
+
+### Goal
+Single task, 10 ms period, real ADXL345 reads. No mutex, no logger.
+Isolating this means any timing problem found here belongs to the task
+or the tick, not to contention.
+
+### Bugs found
+
+**DEVID compared against the wrong constant.**
+```c
+if (id != ADXL345_REG_DEVID) return false;   // 0x00, the register ADDRESS
+```
+Wanted ADXL345_DEVICE_ID (0xE5), the expected value. As written the
+function returned false whenever the sensor was working and true if the
+bus was dead and returning zeros — exactly inverted. The two macro names
+differ by one word and sit four lines apart in the header, which is the
+whole problem. Renaming the value constant to something that cannot be
+mistaken for an address would have prevented it.
+
+Generalizes: when a header defines both an address and its expected
+contents, the names need to be structurally different, not just
+different strings.
+
+**Missing POWER_CTL write.** The ADXL345 comes out of reset in standby.
+Every SPI transaction succeeds, CS toggles correctly, the decode looks
+perfect — and DATAX0..DATAZ1 all read zero. This is a failure mode that
+looks like a bus problem but isn't, which is exactly why reading DEVID
+first is worth the two lines: DEVID is readable in standby, so a good
+DEVID plus zero data localizes the fault to configuration immediately.
+
+**Pointer where storage belonged.** Initial version declared
+`static ADXL345_Accel_t *accel;` (an uninitialized pointer), passed
+`&accel` as pvParameters, and called `adxl345_read_acceleration(&accel)`
+— address-of a pointer, twice over, with nothing ever allocated.
+
+The underlying confusion was about what the struct *is*. A sample is an
+output produced fresh each iteration; it belongs as a task local. A
+device handle would be configuration and could reasonably arrive via
+pvParameters. Decided against a handle entirely: there is exactly one
+ADXL345 on one bus, so a handle is ceremony. If the W25Q64 later
+creates a genuine need for a shared "SPI device" concept, build it then
+with the real requirement in hand rather than speculatively.
+
+### Hardware
+OpenOCD failed with `init mode failed` and reported target voltage
+4.42 V — should be ~3.3 V. Cause was seating the Nucleo directly in the
+breadboard; the header rows do not straddle the center channel, so
+adjacent pins short through shared columns and 5V bridged onto 3V3.
+Fix: Nucleo stays off the breadboard, jumpers run from its headers to
+the sensor and passives.
+
+Worth remembering that the voltage reading in OpenOCD's banner is a
+real diagnostic, not decoration. 4.42 V pointed straight at the wiring
+before any time was spent on SWD configuration or connect-under-reset.
+
+### GDB: scope and initialization
+First attempt at `p sample` broke at line 50 — the function's opening
+brace, before the local is initialized. Read back
+`x = -23131, y = -23131`, which is 0xA5A5: the FreeRTOS stack fill
+pattern, not data. The two axes being *identical* was the giveaway.
+
+Second attempt failed with "No symbol sample in current context" while
+stopped in prvIdleTask — locals only exist in their own frame.
+
+Both are obvious in retrospect and both cost a minute. The rule:
+breakpoint placement has to account for where a value becomes valid,
+not just where the variable is named. File-scope statics (like
+`overruns`) are readable from anywhere; locals are not.
+
+### Verification
+Rotating the board moved gravity cleanly between axes:
+
+x=3, y=31, z=-223
+x=-256, y=11, z=12
+x=4, y=-255, z=10
+
+~250-256 counts on the loaded axis, other two within ~30 of zero. At
+±2g and 10-bit that is 256 counts/g, which matches the datasheet
+exactly. Signs reflect breakout orientation, not an error.
+
+This is the end-to-end proof: measure mode active, SPI byte order
+correct, little-endian int16 reassembly correct.
+
+overruns = 0. No missed deadlines at 10 ms with a ~150 us transfer.
+
+### Known inefficiency, deliberately left alone
+spi1_transfer() calls spi1_wait_idle() between *every* byte, waiting for
+BSY to clear before checking RXNE. That fully serializes the transfer —
+no pipelining — and busy-waits at the task's priority the whole time.
+At 390 kHz (BR=111, PCLK/256) a 7-byte read is ~144 us of spinning.
+
+Invisible with one task. Once the logger exists, that is 144 us the
+logger cannot run. BSY only needs to be clear before deasserting CS at
+the end of a transaction, not between bytes.
+
+Not changing it now: this milestone is measuring baseline timing, and
+moving two variables at once destroys the measurement. Fix it after the
+baseline capture exists.
+
+### Next
+1. Logic analyzer on PA8: confirm 10.00 ms period, ~150 us pulse width.
+   4 MSa/s, rising-edge trigger, ~100 ms window. This is the baseline
+   trace that the broken-mutex and fixed-mutex captures get compared
+   against — same axes, same settings, three screenshots.
+2. Add DATA_FORMAT and BW_RATE writes to adxl345_init(). Defaults are
+   already ±2g / 100 Hz, but writing them explicitly makes the coupling
+   between the sensor's ODR and the task period visible in code instead
+   of inherited silently.
+3. Then the logger task and the SPI mutex.
+
+Open: TIM2 free-running microsecond counter still not set up. Will want
+it for in-code timing once the mutex work starts.

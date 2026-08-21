@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #define ADXL345_REG_DEVID        0x00
 #define ADXL345_REG_BW_RATE      0x2C
@@ -22,10 +23,10 @@ typedef struct
     int16_t y;
     int16_t z;
 
-} ADXL345_Accel;
+} ADXL345_Accel_t;
 
 
-void adxl345_init(void);
+bool adxl345_init(void);
 
 uint8_t adxl345_read_register(uint8_t reg);
 
@@ -41,5 +42,5 @@ void adxl345_read_multiple_registers(
 );
 
 void adxl345_read_acceleration(
-    ADXL345_Accel *accel
+    ADXL345_Accel_t *accel
 );

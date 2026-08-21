@@ -20,7 +20,7 @@ static inline void adxl345_cs_high(void)
 }
 
 
-void adxl345_init(void)
+bool adxl345_init(void)
 {
     adxl345_cs_high();
 
@@ -31,6 +31,12 @@ void adxl345_init(void)
     ADXL345_CS_PORT->MODER |=
         (1U << (ADXL345_CS_PIN * 2U));
 
+    uint8_t id = adxl345_read_register(ADXL345_REG_DEVID);
+    if (id != ADXL345_DEVICE_ID) return false;
+
+    adxl345_write_register(ADXL345_REG_POWER_CTL, 0x08);   // MEASURE bit → measurement mode
+
+    return true; // success
 }
 
 
@@ -85,7 +91,7 @@ void adxl345_read_multiple_registers(uint8_t reg, uint8_t *buffer, uint8_t lengt
 }
 
 
-void adxl345_read_acceleration(ADXL345_Accel *accel)
+void adxl345_read_acceleration(ADXL345_Accel_t *accel)
 {
     uint8_t buffer[6];
 
