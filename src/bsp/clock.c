@@ -11,6 +11,7 @@ void clock_init(void)
 
 	// enable APB1 peripheral clock and adjust PWR voltage regulator
 	RCC->APB1ENR |= RCC_APB1ENR_PWREN;
+	(void)RCC->APB1ENR; // read back to ensure clock is enabled
 	PWR->CR = (PWR->CR & ~PWR_CR_VOS) | (0x3UL << PWR_CR_VOS_Pos); // set voltage scaling to scale 1
 	
 	// RCC configuration apb and ahb prescalers

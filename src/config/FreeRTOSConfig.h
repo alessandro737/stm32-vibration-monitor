@@ -25,7 +25,7 @@
 #define configMINIMAL_STACK_SIZE					( ( unsigned short ) 256 ) // STACK_SIZE in words (4B in a word)
 #define configSUPPORT_STATIC_ALLOCATION   			1
 #define configSUPPORT_DYNAMIC_ALLOCATION  			0
-#define configMAX_TASK_NAME_LEN						( 10 )
+#define configMAX_TASK_NAME_LEN						( 16 )
 #define configUSE_16_BIT_TICKS						0
 #define configUSE_MUTEXES							1
 #define configCHECK_FOR_STACK_OVERFLOW				2

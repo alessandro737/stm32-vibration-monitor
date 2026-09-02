@@ -1083,3 +1083,87 @@ baseline capture exists.
 
 Open: TIM2 free-running microsecond counter still not set up. Will want
 it for in-code timing once the mutex work starts.
+
+## 2026-08-21 — SPI mutex arbitration under contention
+
+### Goal
+Put a real contender on the SPI bus and measure what the acquisition
+task actually loses when the mutex is held across a long operation.
+
+### Setup
+fklogger_task at priority 1 takes the mutex, does a one-byte DEVID
+read, busy-waits 400 ms without yielding, releases, then vTaskDelay
+(1000 ms). The busy-wait is a stand-in for a W25Q64 sector erase
+(datasheet worst case 400 ms); the flash driver is out of scope.
+
+Note the logger's actual period is 1400 ms, not 1000 — vTaskDelay is
+relative to the call, so the hold is not included. Side effect: the
+block lands at a different phase of the 10 ms acquisition grid every
+cycle, which is useful, since it shows the deadline miss is not an
+artifact of a particular alignment.
+
+Probes: PA8 (acquisition), PB10 (logger). Both raised before the mutex
+take and lowered after the release, so probe width includes blocked
+time, not just transaction time.
+
+### Results
+
+Capture 1 (2026-08-21_blocking_400ms.png): steady-state SPI every
+10 ms. Logger takes the mutex; PA8 goes high on the next acquisition
+period and stays high for ~400 ms. One transaction that costs ~50 us
+uncontended took four orders of magnitude longer. `overruns` climbs by
+~40 per logger cycle, matching 400 ms / 10 ms.
+
+Capture 2 (2026-08-21_catchup_burst.png): on release, the acquisition
+task runs its entire backlog back-to-back over ~6.4 ms rather than
+resuming at 10 ms. xTaskDelayUntil advances *pxPreviousWakeTime by
+exactly one increment per call regardless of whether it delayed, so a
+40-period backlog produces 40 immediate iterations.
+
+PB10 does not fall at the release — it falls at the *end* of the
+burst. Giving the mutex revokes priority inheritance, the acquisition
+task at priority 3 immediately preempts, and the logger does not get
+the CPU back to lower its own probe until the backlog is drained. So
+PB10 width overstates the hold; PA8 is the honest measurement of
+blocked time.
+
+### Unmeasured
+- Per-transaction cost inside the burst. Eyeball ~150 us against a
+  wire time closer to 10 us, so most of it is software overhead. Needs
+  cursors. TBD.
+- SCK frequency. The capture is at 8 MSa/s; if the /16 prescaler at
+  100 MHz APB2 really gives 6.25 MHz, SCK is undersampled and both the
+  clock trace and the decode are unreliable for that measurement.
+  Needs a separate high-rate capture, and it decides whether the bus
+  is over the ADXL345's 5 MHz ceiling.
+
+### What this is and isn't
+This is a bounded-blocking demonstration, not priority inversion.
+Priority inheritance is doing its job: the logger runs at 3 while
+holding, nothing can preempt it, and the acquisition task waits
+exactly the hold time. Calling this inversion would be wrong.
+
+Unbounded inversion needs a task at a priority between the two that
+can preempt the holder, and a binary semaphore (no ownership, no
+inheritance) to let it. Level 2 is reserved and configUSE_TIMERS=0
+keeps the timer service task off it.
+
+### Next
+1. Cursor capture 1 and 2 for the two TBDs above.
+2. High-rate capture to settle SCK.
+3. Add the priority-2 hog. Capture mutex vs binary semaphore on the
+   same time axis.
+
+### Incidental
+Added read-backs after the RCC clock-enable writes in probe_init and
+fklogger_probe_init. Never observed a failure, but the store to
+AHB1ENR is posted and the erratum ("delay after an RCC peripheral
+clock enabling") documents the hazard; ST's own HAL macro does the
+same read-back. Failure mode here would have been loud — MODER write
+lost, pin stays an input, probe never toggles.
+
+Left OSPEEDR at reset on both probe pins. Deliberate: at lowest slew
+the edge is tens of ns against events tens of us wide. This is the
+register that caused the PA5 SPI corruption, where the slew delay was
+comparable to the bit period. Same register, different conclusion,
+because the timescale is different.
