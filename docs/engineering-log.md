@@ -1360,3 +1360,108 @@ August session would give an actual error rate; deferred.
 Add the priority-2 CPU-burner and capture mutex vs binary semaphore on
 the same time axis. That's the unbounded-inversion demonstration the
 README describes and the current captures do not show.
+
+## 2026-09-09 (cont.) — Unbounded priority inversion, measured
+
+### Goal
+Add the medium-priority task the inversion scenario structurally
+requires, and get the mutex vs binary-semaphore A/B that turns the
+README's claim into a measurement.
+
+### The hog
+Priority 2, between acquisition(3) and logger(1). Takes no lock,
+touches no SPI — that is the whole design. If it contended for the bus
+it would block like everything else and the scenario collapses. Its
+uselessness is load-bearing; in a real system it stands in for any
+bus-independent periodic work (CAN heartbeat, watchdog, control loop)
+that happens to sit between the sampler and the logger in priority.
+
+First attempt copied the logger's 400 ms burn / vTaskDelay(1000)
+structure. That gave both tasks an identical 1400 ms effective period,
+and since the hog runs first its own burn delayed the logger's start by
+exactly 400 ms — the two phase-locked in antiphase and never
+overlapped. Fixed by going to 20 ms on / 20 ms off: ~10 burns land
+inside any hold, so phase stops mattering. Kept vTaskDelay rather than
+xTaskDelayUntil deliberately, so the phase drifts and the result cannot
+be an artifact of one alignment.
+
+Probe on PB4 (D6). Note PB4's MODER reset value is 0x280 — it comes up
+as NJTRST in alternate function, not as input like the port A pins. The
+clear-then-set is doing real work there.
+
+### The blocker that cost an hour
+With the hog running and overlapping correctly, PA8 measured 392 ms
+under *both* lock types. D6 flat under the mutex, pulsing under the
+semaphore — mechanism visibly different, block identical.
+
+Cause: the logger's hold was
+
+    while ((xTaskGetTickCount() - start) < pdMS_TO_TICKS(400)) { }
+
+which measures **elapsed time, not CPU time**. The hog could steal
+every other 20 ms slice and the tick counter advanced anyway, so when
+the logger next got scheduled the 400 ms had passed and it released on
+schedule. Starvation could not extend the hold, so the block could not
+grow past it.
+
+Replaced with a fixed work quantum — a file-scope `static volatile`
+counter loop. `volatile` is required or -Og deletes the loop entirely.
+HOLD_ITERATIONS calibrated by capture: first guess gave 729.58 ms,
+scaled by 400/729.58, landed at 410.04 ms. Empirical, not derived —
+will drift with optimization level, clock rate, or code alignment.
+
+Worth being honest about the tradeoff: a real W25Q64 erase *is*
+wall-clock bounded, so the original busy-wait was the more faithful
+stand-in for the hardware. The work-based version models a driver
+polling for completion. It is the one that makes the inversion visible,
+but it is a different simplification, not a strictly better one.
+
+### Results
+
+|  | mutex | binary semaphore | ratio |
+|---|---|---|---|
+| PA8 (block) | ~410 ms | **777.25 ms** | 1.90× |
+| PB10 (hold) | 410.04 ms | **785.59 ms** | 1.92× |
+| D6 during hold | flat | pulsing | — |
+
+Predicted ~820 ms from a 50%-duty hog; 785.59 implies effective duty
+~48%, inside tick granularity.
+
+**Mutex path.** Inheritance is reactive — it fires when a higher
+priority task *blocks* on the lock, not when the holder takes it. So
+the sequence is: logger takes at priority 1, hog preempts freely,
+acquisition hits its next 10 ms deadline and blocks, logger inherits 3,
+hog goes flat. The pre-block window is visible as the offset between
+PB10's rise and PA8's: 8.3 ms, against a 10 ms acquisition period.
+Exactly the expected bound.
+
+**Semaphore path.** No ownership, no inheritance. The hog preempts the
+holder for the entire hold and D6 pulses straight through. The
+inflation scales with the hog's duty cycle and nothing in the system
+caps it — at 80% duty the hold would exceed 2 s. That scaling is what
+makes it *unbounded* rather than merely longer, and it is the
+distinction the two-task captures could not make.
+
+**Cost of inheritance.** D6 flat for 410 ms under the mutex is
+priority-2 work being starved for the duration of the hold. That is
+the tradeoff inheritance buys you, not a side effect — worth naming,
+since a real system has to reason about it.
+
+### Captures
+- `2026-09-09_mutex_hold_410ms.png`
+- `2026-09-09_semaphore_hold_785ms.png`
+- `2026-09-09_mutex_hog_starved.png`
+- `2026-09-09_semaphore_hog_running.png`
+
+### Still open
+`overruns` not read on either config. Expect ~41 vs ~78 per logger
+cycle — the same result counted in missed deadlines rather than
+milliseconds. Two independent measurements agreeing is worth having;
+deferred to next session.
+
+### Next
+- Read overruns on both configs, add to the table above.
+- Annotate the 08-21 entry with a pointer to today's corrections, so a
+  chronological reader hits the fix and not just the wrong number.
+- README: the inversion claim is now backed. Update it, and drop the
+  stale "hardware not in hand" line.

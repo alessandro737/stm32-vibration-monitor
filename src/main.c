@@ -14,6 +14,9 @@
 
 #define PROBE_PIN 8
 #define FKL_PROBE_PIN 10
+#define HOG_PROBE_PIN 4
+#define USE_MUTEX 0   // 0 = binary semaphore (no inheritance), 1 = mutex
+#define HOLD_ITERATIONS 3300000
 
 static StaticTask_t xAcquisitionTCB;
 static StackType_t xAcquisitionStack[128];
@@ -21,14 +24,20 @@ static StackType_t xAcquisitionStack[128];
 static StaticTask_t xFakeLoggerTCB;
 static StackType_t xFKLoggerStack[256];
 
-static SemaphoreHandle_t xMutex;
-static StaticSemaphore_t xMutexBuffer;
+static SemaphoreHandle_t xSpiLock;
+static StaticSemaphore_t xSpiLockBuffer;
+
+static StaticTask_t xHoggerTCB;
+static StackType_t xHoggerStack[128];
 
 static void fklogger_task (void *pvParameters);
 void fklogger_probe_init (void);
 
 static void acquisition_task (void *pvParameters);
 void probe_init(void);
+
+static void hogger_task (void *pvParameters);
+void hogger_probe_init (void);
 
 int main(void)
 {   
@@ -42,9 +51,15 @@ int main(void)
     } 
     probe_init(); 
     fklogger_probe_init();
+    hogger_probe_init();
 
-    xMutex = xSemaphoreCreateMutexStatic(&xMutexBuffer);
-    configASSERT(xMutex != NULL);
+#if USE_MUTEX
+    xSpiLock = xSemaphoreCreateMutexStatic(&xSpiLockBuffer);
+#else
+    xSpiLock = xSemaphoreCreateBinaryStatic(&xSpiLockBuffer);
+    xSemaphoreGive(xSpiLock); // give the binary semaphore so it can be taken
+#endif
+    configASSERT(xSpiLock != NULL);
 
     TaskHandle_t acq_handle = xTaskCreateStatic(
         acquisition_task,
@@ -57,7 +72,6 @@ int main(void)
     );
     configASSERT(acq_handle != NULL);
 
-    /** TODO: FKLOGGER TASK */
     TaskHandle_t log_handle = xTaskCreateStatic(
         fklogger_task,
         "FKLogger_task",
@@ -68,6 +82,17 @@ int main(void)
         &xFakeLoggerTCB
     );
     configASSERT(log_handle != NULL);
+
+    TaskHandle_t hog_handle = xTaskCreateStatic(
+        hogger_task,
+        "Hogger_task",
+        128,
+        NULL,
+        2,
+        xHoggerStack,
+        &xHoggerTCB
+    );
+    configASSERT(hog_handle != NULL);
 
     vTaskStartScheduler();
 
@@ -90,9 +115,9 @@ static void acquisition_task(void *pvParameters)
         // probe high
         GPIOA->BSRR = (0x1UL << (PROBE_PIN));
         // critical section
-        xSemaphoreTake(xMutex, portMAX_DELAY);
+        xSemaphoreTake(xSpiLock, portMAX_DELAY);
         adxl345_read_acceleration(&sample);
-        xSemaphoreGive(xMutex);
+        xSemaphoreGive(xSpiLock);
         // probe low
         GPIOA->BSRR = (0x1UL << (PROBE_PIN + 16));
     }
@@ -116,7 +141,6 @@ void probe_init(void)
 
 static void fklogger_task (void *pvParameters)
 {
-    /** TODO: take mutex, small spi transac, busy-wait (400ms), give mutex, vTaskDelay(1000) */
     (void)pvParameters;
 
     volatile uint8_t id;
@@ -126,16 +150,17 @@ static void fklogger_task (void *pvParameters)
         // probe high
         GPIOB->BSRR = (0x1UL << (FKL_PROBE_PIN));
 
-        xSemaphoreTake(xMutex, portMAX_DELAY);
+        xSemaphoreTake(xSpiLock, portMAX_DELAY);
         // spi transac
         id = adxl345_read_register(ADXL345_REG_DEVID);
+        (void)id; // silence unused variable warning
 
-        // busy-wait 400ms
-        TickType_t start = xTaskGetTickCount();
-        while ((xTaskGetTickCount() - start) < pdMS_TO_TICKS(400)) {
-            /* spin, no yield */
+        static volatile uint32_t sink;
+        for (uint32_t i = 0; i < HOLD_ITERATIONS; i++) {
+            sink = i;
+            (void)sink; // silence unused variable warning
         }
-        xSemaphoreGive(xMutex);
+        xSemaphoreGive(xSpiLock);
 
         // probe low
         GPIOB->BSRR = (0x1UL << (FKL_PROBE_PIN + 16));
@@ -158,4 +183,32 @@ void fklogger_probe_init (void)
     GPIOB->BSRR = (0x1UL << (FKL_PROBE_PIN + 16));
     
     GPIOB->MODER |= (0x1UL << (FKL_PROBE_PIN * 2));
+}
+
+static void hogger_task (void *pvParameters){
+    (void)pvParameters;
+
+    for (;;) {
+        GPIOB->BSRR = (0x1UL << HOG_PROBE_PIN);
+        TickType_t start = xTaskGetTickCount();
+        while ((xTaskGetTickCount() - start) < pdMS_TO_TICKS(20)) { }
+        GPIOB->BSRR = (0x1UL << (HOG_PROBE_PIN + 16));
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+}
+
+void hogger_probe_init (void){
+    // GPIO port B is already enabled 
+    // in fklogger_probe_init, 
+    // no need to enable again
+    
+    // enable pins to be output
+    // clear and set
+    GPIOB->MODER &= ~(0x03UL << (HOG_PROBE_PIN * 2));
+
+    // set pins low before output config
+    GPIOB->BSRR = (0x1UL << (HOG_PROBE_PIN + 16));
+    
+    GPIOB->MODER |= (0x1UL << (HOG_PROBE_PIN * 2));
 }
