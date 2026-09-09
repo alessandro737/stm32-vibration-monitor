@@ -58,7 +58,7 @@ void spi1_init(void)
      * MSB first
      * Software NSS
      *
-     * BR = 111 -> PCLK / 256 Slowest speed for initial debugging
+     * BR = 100 -> PCLK / 32 Slowest speed for initial debugging
      * ADXL345 caps at 5 MHz, /16 overshoots, /32 is the nearest legal divisor
      * 
      */
@@ -68,7 +68,7 @@ void spi1_init(void)
         SPI_CR1_MSTR |
         SPI_CR1_SSM  |
         SPI_CR1_SSI  |
-        (7U << SPI_CR1_BR_Pos);
+        (4U << SPI_CR1_BR_Pos);
 
     SPI1->CR1 &= ~SPI_CR1_DFF; // 8-bit data frame format
 

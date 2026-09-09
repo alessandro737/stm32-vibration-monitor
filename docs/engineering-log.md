@@ -1261,3 +1261,102 @@ chasing.
 Watch for signal integrity at 8× the edge rate. PA7 (MOSI) OSPEEDR was
 tested and found unnecessary at 390 kHz; that result does not
 necessarily hold at 3.125 MHz.
+
+## 2026-09-09 (cont.) — SPI1 to 3.125 MHz
+
+### Goal
+Raise the prescaler off its debug-era /256 setting, and use the change
+as an A/B to separate wire time from software cost.
+
+### Choosing the divisor
+The grid is powers of two, so the options bracket the ADXL345's limits
+badly. Two independent specs from datasheet Table 9 rule out /16:
+
+- fSCLK max 5 MHz. /16 gives 6.25 MHz.
+- tSDO max 95 ns (SCLK falling edge to SDO transition). In mode 3 the
+  slave drives on the falling edge and the master samples on the next
+  rising edge, so the budget is one half-period. /16 gives 80 ns —
+  15 ns short. The sensor physically cannot present valid data before
+  the STM32 samples it.
+
+| Prescaler | SCK | Half-period | tSDO margin |
+|---|---|---|---|
+| /256 (was) | 390.6 kHz | 1280 ns | 1185 ns |
+| /64 | 1.5625 MHz | 320 ns | 225 ns |
+| **/32** | **3.125 MHz** | **160 ns** | **65 ns** |
+| /16 | 6.25 MHz | 80 ns | **−15 ns** |
+
+/32 it is. Note Table 9 footnote 2: these are characterization results
+at 100 pF bus load, not production tested, so 65 ns is not a guaranteed
+margin. Breadboard jumpers are well under 100 pF, which helps.
+
+tCS,DIS (250 ns min between CS deassertions) does not tighten — CS is
+software-driven via BSRR, so that interval is absolute and independent
+of SCK. Even inside the catch-up burst transactions are ~20 us apart.
+
+No ADXL345-side changes. There is no clock configuration register on
+the part; SCLK rate lives entirely in SPI1->CR1. BW_RATE stays at its
+default 0x0A (rate code 1010 = 100 Hz ODR, 50 Hz bandwidth), which
+already matches the acquisition period.
+
+### Measured
+`(4U << SPI_CR1_BR_Pos)`, CR1 reads 0x367.
+
+| | /256 | /32 |
+|---|---|---|
+| CS-low | 145.375 us | **22.125 us** |
+| Predicted clocking (56 bits) | 143.36 us | 17.92 us |
+| Residual | ~2.0 us | **~4.2 us** |
+
+**The residual grew, and the earlier number was the unreliable one.**
+2.0 us was a 1.4% difference between two ~144 us figures, inside the
+error bars of the SCK estimate itself — a half-period cursor reading
+400 kHz rather than 390.625 shifts predicted wire time by ~3 us, which
+swallows the whole residual. At /32 the same quantity is 19% of the
+transaction and resolvable.
+
+So per-transaction software cost is ~4.2 us: ~700 ns per inter-byte gap
+across six gaps, about 70 cycles at 100 MHz for a TXE-poll, DR write,
+RXNE-poll, DR read round trip through the APB bridge. Plausible for
+volatile accesses at -Og. Correct the earlier "98.6% wire time" claim
+to ~97%, and note that the overhead was never separable at /256.
+
+### Verified in RAM, not just on the wire
+The analyzer alone cannot close this. The August corruption bug was a
+pin-vs-RAM divergence — MISO showed correct bytes throughout while the
+shift register latched wrong ones. A tSDO failure has the same
+signature: valid data, arriving 95 ns after the master already sampled.
+
+`sample` is a stack local in acquisition_task, so it needs a frame:
+breakpoint at line 95 (after adxl345_read_acceleration returns, before
+the mutex give), then `p sample` per hit.
+
+13 consecutive reads, board flat: x 9–13, y 28–32, z −218 to −221. No
+corruption, and none of the bit-0-carries-previous-byte pattern the
+OSPEEDR bug produced. PA7 OSPEEDR was found unnecessary at 390 kHz and
+is still unnecessary at 3.125 MHz.
+
+Reorientation check: tipping the board about X moved gravity from Z to
+Y, 11/30/−221 → 10/−255/12, with X near zero throughout. Confirms the
+axis mapping in the burst read is real and not a coincidental byte
+order.
+
+Magnitude differs between orientations — 223 counts flat vs 256 on
+edge, i.e. 0.87 g vs 1.00 g at 256 LSB/g. That is per-axis zero-g
+offset; the datasheet specs Z's typical offset worse than X/Y, and
+~35 LSB on Z is in spec. OFSZ (0x20, 15.6 mg/LSB) exists if it ever
+matters. Not worth trimming here.
+
+### Not measured
+`overruns` is meaningless for this session — 14 breakpoint halts inside
+the critical section let xTaskDelayUntil accumulate a backlog on every
+stop. The ~40-per-logger-cycle figure from 08-21 stands as the real one.
+
+13 reads is a smoke test, not a validation. A 65 ns margin fails
+statistically, not deterministically. The scored harness from the
+August session would give an actual error rate; deferred.
+
+### Next
+Add the priority-2 CPU-burner and capture mutex vs binary semaphore on
+the same time axis. That's the unbounded-inversion demonstration the
+README describes and the current captures do not show.
