@@ -58,9 +58,9 @@ void spi1_init(void)
      * MSB first
      * Software NSS
      *
-     * BR = 111 -> PCLK / 256
-     *
-     * Deliberately slow for initial debugging.
+     * BR = 111 -> PCLK / 256 Slowest speed for initial debugging
+     * ADXL345 caps at 5 MHz, /16 overshoots, /32 is the nearest legal divisor
+     * 
      */
     SPI1->CR1 =
         SPI_CR1_CPOL |

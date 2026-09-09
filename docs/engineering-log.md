@@ -1167,3 +1167,97 @@ the edge is tens of ns against events tens of us wide. This is the
 register that caused the PA5 SPI corruption, where the slew delay was
 comparable to the bit period. Same register, different conclusion,
 because the timescale is different.
+
+## 2026-09-09 — SCK frequency settled; correcting the 08-21 timing numbers
+
+### Goal
+Close the open gate on SPI1's actual clock rate, and check the
+per-transaction cost TBD left over from the mutex contention session.
+
+### Method
+Read the registers before capturing, so the capture confirms a
+prediction rather than producing an unanchored number.
+
+(gdb) p/x SPI1->CR1 $1 = 0x37f
+(gdb) p SystemCoreClock $2 = 100000000
+(gdb) p/x RCC->CFGR $3 = 0x100a
+
+
+CR1 bits 5:3 (BR) = `111`, so PCLK/256 — not /16 as previously assumed.
+CFGR: SW/SWS = PLL, HPRE = /1, PPRE1 = `100` = /2 (APB1 50 MHz),
+PPRE2 = `000` = /1, so **APB2 runs undivided at 100 MHz**.
+
+Predicted SCK = 100 MHz / 256 = **390.625 kHz**.
+
+BR = 7 is deliberate, set during the OSPEEDR debugging in August and
+never restored. It was invisible because nothing pushed the deadline:
+a 7-byte burst costs ~143 µs against a 10 ms acquisition period.
+
+### Wire confirmation
+Capture at 8 MSa/s, falling-edge trigger on CS.
+
+Single SCK half-period cursors to 1250 ns → 400 kHz. Against a
+predicted 1280 ns half-period, the 30 ns gap is exactly the 125 ns
+sample grid. (Note: PulseView's cursor readout reports the reciprocal
+of the selected interval, so a half-period selection displays 800 kHz.
+Halve it.)
+
+CS-low window cursors to **145.375 µs** across 56 clock cycles. That's
+the trustworthy frequency measurement — 56 periods of averaging
+instead of one.
+
+MOSI reads `F2 00 00 00 00 00 00`. `0xF2` = `0xC0 | 0x32`: read bit and
+multi-byte bit both set on DATAX0, seven bytes total, so the burst is
+reading six distinct registers rather than repeating one.
+
+MISO payload `0B 00 1E 00 24 FF` → X = +11, Y = +30, Z = 0xFF24 =
+−220 LSB. Board flat, ~1 g on Z at roughly 256 counts/g, consistent
+with the −216 measured on 08-17.
+
+The leading MISO byte varies between captures (`E5`, `FF`). That's the
+address phase, where the ADXL345 isn't driving yet — the `E5` is a
+stale DEVID left in the shift register. Not a fault.
+
+### Corrections to the 2026-08-21 entry
+Two numbers in that entry are wrong and should be read against this one.
+
+**1. SCK was never 6.25 MHz.** That figure came from assuming BR = `011`
+during a code review; nobody read CR1. Actual SCK is 390.625 kHz, a
+factor of 16 below. The ADXL345 5 MHz ceiling was never at risk, so
+the "over spec" concern that gated SPI off the resume was unfounded.
+
+**2. "Most of the ~150 µs is software overhead" is inverted.**
+
+| | |
+|---|---|
+| Predicted wire time (56 bits @ 390.625 kHz) | 143.36 µs |
+| Measured CS-low | 145.375 µs |
+| Residual (CS setup/hold + 6 inter-byte gaps) | **~2.0 µs** |
+
+~300 ns per gap in `spi1_transfer`'s TXE-poll / write / RXNE-poll /
+read loop — about 30 cycles at 100 MHz, which is plausible for that
+path. The transaction is **98.6% wire time**. The lever is the
+prescaler, not the driver.
+
+### Lesson
+A derived number and a read number are not the same kind of fact. The
+6.25 MHz figure survived three weeks of notes, a code review, and a
+resume decision without anyone spending thirty seconds in GDB. The
+same class of error as the OSPEEDR bug in reverse: that one was the
+register telling the truth while the pin lied, this one was nobody
+asking the register at all.
+
+### Next
+Change BR to `100` (/32 → 3.125 MHz) and re-capture the same burst.
+/16 would give 6.25 MHz and genuinely exceed the ADXL345's 5 MHz
+ceiling, so /32 is the nearest legal setting.
+
+Prediction: CS-low drops to **~19.9 µs** (17.9 µs wire + the same ~2 µs
+residual, which should not scale with SCK). If the residual stays flat,
+wire time and software cost are cleanly separated. If it grows, the
+polling loop is interacting with the faster bus and that's worth
+chasing.
+
+Watch for signal integrity at 8× the edge rate. PA7 (MOSI) OSPEEDR was
+tested and found unnecessary at 390 kHz; that result does not
+necessarily hold at 3.125 MHz.
